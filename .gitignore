@@ -1,0 +1,21 @@
+# Runtime data and secrets
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+logs/
+upload/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+node_modules/
+dist/
+target/
+.gocache/
+.gomodcache/
+new-api.tar
+antigravity.tar
+

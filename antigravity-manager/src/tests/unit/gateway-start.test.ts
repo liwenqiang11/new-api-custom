@@ -1,0 +1,106 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_APP_CONFIG } from '@/modules/config/types';
+
+const { mockCreate, mockLogger } = vi.hoisted(() => ({
+  mockCreate: vi.fn(),
+  mockLogger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+vi.mock('@nestjs/core', () => ({
+  NestFactory: {
+    create: mockCreate,
+  },
+}));
+
+vi.mock('@nestjs/platform-fastify', () => ({
+  FastifyAdapter: vi.fn(),
+}));
+
+vi.mock('@/shared/logging/logger', () => ({
+  logger: mockLogger,
+}));
+
+describe('gateway server startup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    const { stopNestServer } = await import('@/server/main');
+    await stopNestServer();
+  });
+
+  it('reports EADDRINUSE as an expected startup failure and cleans up the server', async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    const listen = vi.fn().mockRejectedValue(
+      Object.assign(new Error('listen EADDRINUSE: address already in use 0.0.0.0:8045'), {
+        code: 'EADDRINUSE',
+      }),
+    );
+    mockCreate.mockResolvedValue({
+      enableCors: vi.fn(),
+      listen,
+      close,
+    });
+
+    const { bootstrapNestServer, getNestServerStatus } = await import('@/server/main');
+    const result = await bootstrapNestServer(DEFAULT_APP_CONFIG.proxy);
+
+    expect(result).toEqual({
+      success: false,
+      reason: 'address-in-use',
+      port: 8045,
+      message: 'Port 8045 is already in use',
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      'NestJS Proxy Server could not start: Port 8045 is already in use',
+      expect.any(Error),
+    );
+    expect(mockLogger.error).not.toHaveBeenCalledWith(
+      'Failed to start NestJS server',
+      expect.anything(),
+    );
+
+    await expect(getNestServerStatus()).resolves.toMatchObject({
+      running: false,
+      port: 0,
+      base_url: '',
+    });
+  });
+
+  it('returns the actual configured port when startup succeeds', async () => {
+    const listen = vi.fn().mockResolvedValue(undefined);
+    mockCreate.mockResolvedValue({
+      enableCors: vi.fn(),
+      listen,
+      close: vi.fn().mockResolvedValue(undefined),
+      get: vi.fn(() => ({
+        getAccountCount: () => 0,
+      })),
+    });
+
+    const { bootstrapNestServer, getNestServerStatus } = await import('@/server/main');
+    const result = await bootstrapNestServer({
+      ...DEFAULT_APP_CONFIG.proxy,
+      port: 8123,
+    });
+
+    expect(result).toEqual({
+      success: true,
+      port: 8123,
+      base_url: 'http://localhost:8123',
+    });
+    expect(listen).toHaveBeenCalledWith(8123, '0.0.0.0');
+
+    await expect(getNestServerStatus()).resolves.toMatchObject({
+      running: true,
+      port: 8123,
+      base_url: 'http://localhost:8123',
+    });
+  });
+});

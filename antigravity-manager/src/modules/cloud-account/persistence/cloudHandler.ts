@@ -1,0 +1,1697 @@
+import Database from 'better-sqlite3';
+import path from 'path';
+import fs from 'fs';
+import { v4 as uuidv4 } from 'uuid';
+import { desc, eq } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { isNumber, isObjectLike, isPlainObject, isString } from 'lodash-es';
+import { getCloudAccountsDbPath, getAntigravityDbPaths } from '@/shared/platform/paths';
+import { logger } from '@/shared/logging/logger';
+import {
+  CloudAccount,
+  CloudAccountSchema,
+  CloudQuotaDataSchema,
+  CloudTokenDataSchema,
+} from '@/modules/cloud-account/types';
+import { type AntigravityAppTarget, resolveAntigravityAppTarget } from '@/modules/account/types';
+import type { DeviceProfile, DeviceProfileVersion } from '@/modules/identity-profile/types';
+import { ItemTableValueRowSchema, TableInfoRowSchema } from '@/shared/persistence/database/types';
+import { decryptWithMigration, encrypt, type KeySource } from '@/shared/security/security';
+import { ProtobufUtils } from '@/shared/serialization/protobuf';
+import { GoogleAPIService } from '@/modules/cloud-account/services/GoogleAPIService';
+import {
+  getAntigravityVersion,
+  isCredentialStoreVersion,
+  isNewVersion,
+} from '@/modules/antigravity-runtime/utils/antigravityVersion';
+import { parseRow, parseRows } from '@/shared/persistence/database/sqlite';
+import { getAppErrorData } from '@/shared/errors/appError';
+import {
+  configureDatabase,
+  openDrizzleConnection,
+} from '@/shared/persistence/database/dbConnection';
+import { writeAntigravityCredentialStoreToken } from './antigravityCredentialStore';
+import { accounts, itemTable, settings } from '@/shared/persistence/database/schema';
+import * as drizzleSchema from '@/shared/persistence/database/schema';
+
+const SQLITE_BUSY_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED']);
+const SQLITE_BUSY_TIMEOUT_MS = 3000;
+const SQLITE_RETRY_DELAY_MS = 150;
+const SQLITE_MAX_RETRIES = 3;
+const DEVICE_PAYLOAD_SCHEMA_VERSION = 1;
+const ACTIVE_ACCOUNT_SETTING_PREFIX = 'active_cloud_account';
+type DrizzleExecutor = Pick<
+  BetterSQLite3Database<typeof drizzleSchema>,
+  'insert' | 'update' | 'delete' | 'select'
+>;
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (!isObjectLike(error)) {
+    return false;
+  }
+  const err = error as { code?: string; message?: string };
+  if (err.code && SQLITE_BUSY_CODES.has(err.code)) {
+    return true;
+  }
+  if (isString(err.message)) {
+    return err.message.includes('SQLITE_BUSY') || err.message.includes('SQLITE_LOCKED');
+  }
+  return false;
+}
+
+function isDataMigrationError(error: unknown): boolean {
+  return getAppErrorData(error)?.appErrorCode === 'DATA_MIGRATION_FAILED';
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const array = new Int32Array(buffer);
+  Atomics.wait(array, 0, 0, ms);
+}
+
+/**
+ * Ensures that the cloud database file and schema exist.
+ * @param dbPath {string} The path to the database file.
+ */
+function ensureDatabaseInitialized(dbPath: string): void {
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath);
+    configureDatabase(db, { busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS });
+
+    // Create accounts table
+    // Storing complex objects (token, quota) as JSON strings for simplicity
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        email TEXT NOT NULL,
+        name TEXT,
+        avatar_url TEXT,
+        token_json TEXT NOT NULL,
+        quota_json TEXT,
+        device_profile_json TEXT,
+        device_history_json TEXT,
+        created_at INTEGER NOT NULL,
+        last_used INTEGER NOT NULL,
+        status TEXT DEFAULT 'active',
+        status_reason TEXT,
+        is_active INTEGER DEFAULT 0
+      );
+    `);
+
+    // Migration: Check if is_active column exists
+    const tableInfoRaw = db.pragma('table_info(accounts)') as any[];
+    const tableInfo = parseRows(TableInfoRowSchema, tableInfoRaw, 'cloud.accounts.tableInfo');
+    const hasIsActive = tableInfo.some((col) => col.name === 'is_active');
+    const hasDeviceProfileJson = tableInfo.some((col) => col.name === 'device_profile_json');
+    const hasDeviceHistoryJson = tableInfo.some((col) => col.name === 'device_history_json');
+    const hasProxyUrl = tableInfo.some((col) => col.name === 'proxy_url');
+    const hasStatusReason = tableInfo.some((col) => col.name === 'status_reason');
+    if (!hasIsActive) {
+      db.exec('ALTER TABLE accounts ADD COLUMN is_active INTEGER DEFAULT 0');
+    }
+    if (!hasDeviceProfileJson) {
+      db.exec('ALTER TABLE accounts ADD COLUMN device_profile_json TEXT');
+    }
+    if (!hasDeviceHistoryJson) {
+      db.exec('ALTER TABLE accounts ADD COLUMN device_history_json TEXT');
+    }
+    if (!hasProxyUrl) {
+      db.exec('ALTER TABLE accounts ADD COLUMN proxy_url TEXT');
+    }
+    if (!hasStatusReason) {
+      db.exec('ALTER TABLE accounts ADD COLUMN status_reason TEXT');
+    }
+
+    // Create index on email for faster lookups
+    // Create index on email for faster lookups
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);`);
+
+    // Create settings table
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+  } catch (error) {
+    logger.error('Failed to initialize cloud database schema', error);
+    throw error;
+  } finally {
+    if (db) db.close();
+  }
+}
+
+/**
+ * Gets a connection to the cloud accounts database.
+ */
+function getCloudDb(): {
+  raw: Database.Database;
+  orm: BetterSQLite3Database<typeof drizzleSchema>;
+} {
+  const dbPath = getCloudAccountsDbPath();
+  ensureDatabaseInitialized(dbPath);
+  return openDrizzleConnection(
+    dbPath,
+    { readonly: false, fileMustExist: false },
+    { busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS },
+  );
+}
+
+function getIdeDb(
+  dbPath: string,
+  readOnly: boolean,
+): { raw: Database.Database; orm: BetterSQLite3Database<typeof drizzleSchema> } {
+  return openDrizzleConnection(
+    dbPath,
+    { readonly: readOnly },
+    { readOnly, busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS },
+  );
+}
+
+interface MigrationStats {
+  totalFields: number;
+  fallbackUsedFields: number;
+  migratedFields: number;
+  migratedBySource: Record<KeySource, number>;
+  failedFields: number;
+}
+
+function readStringCandidate(
+  source: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
+  for (const key of keys) {
+    const candidate = source[key];
+    if (isString(candidate) && candidate.length > 0) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function normalizeDeviceProfile(value: unknown): DeviceProfile | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const valueRecord = value as Record<string, unknown>;
+
+  const machineId = readStringCandidate(valueRecord, 'machineId', 'machine_id');
+  const macMachineId = readStringCandidate(valueRecord, 'macMachineId', 'mac_machine_id');
+  const devDeviceId = readStringCandidate(valueRecord, 'devDeviceId', 'dev_device_id');
+  const sqmId = readStringCandidate(valueRecord, 'sqmId', 'sqm_id');
+
+  if (!machineId || !macMachineId || !devDeviceId || !sqmId) {
+    return undefined;
+  }
+
+  return {
+    machineId,
+    macMachineId,
+    devDeviceId,
+    sqmId,
+  };
+}
+
+function areDeviceProfilesEqual(left: DeviceProfile, right: DeviceProfile): boolean {
+  return (
+    left.machineId === right.machineId &&
+    left.macMachineId === right.macMachineId &&
+    left.devDeviceId === right.devDeviceId &&
+    left.sqmId === right.sqmId
+  );
+}
+
+function readVersionedProfilePayload(value: unknown): unknown {
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const valueRecord = value as Record<string, unknown>;
+  if (!('schemaVersion' in valueRecord)) {
+    return value;
+  }
+
+  const schemaVersion = valueRecord.schemaVersion;
+  if (!isNumber(schemaVersion) || !Number.isFinite(schemaVersion)) {
+    throw new Error('invalid_device_profile_schema_version');
+  }
+  if (schemaVersion !== DEVICE_PAYLOAD_SCHEMA_VERSION) {
+    throw new Error(`unsupported_device_profile_schema_version:${schemaVersion}`);
+  }
+  if (!('profile' in valueRecord)) {
+    throw new Error('invalid_device_profile_payload');
+  }
+  return valueRecord.profile;
+}
+
+function readVersionedHistoryPayload(value: unknown): unknown {
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  const valueRecord = value as Record<string, unknown>;
+  if (!('schemaVersion' in valueRecord)) {
+    return value;
+  }
+
+  const schemaVersion = valueRecord.schemaVersion;
+  if (!isNumber(schemaVersion) || !Number.isFinite(schemaVersion)) {
+    throw new Error('invalid_device_history_schema_version');
+  }
+  if (schemaVersion !== DEVICE_PAYLOAD_SCHEMA_VERSION) {
+    throw new Error(`unsupported_device_history_schema_version:${schemaVersion}`);
+  }
+  if (!('history' in valueRecord)) {
+    throw new Error('invalid_device_history_payload');
+  }
+  return valueRecord.history;
+}
+
+function serializeDeviceProfile(profile: DeviceProfile | undefined): string | null {
+  if (!profile) {
+    return null;
+  }
+  return JSON.stringify({
+    schemaVersion: DEVICE_PAYLOAD_SCHEMA_VERSION,
+    profile,
+  });
+}
+
+function serializeDeviceHistory(history: DeviceProfileVersion[] | undefined): string | null {
+  if (!history || history.length === 0) {
+    return null;
+  }
+  return JSON.stringify({
+    schemaVersion: DEVICE_PAYLOAD_SCHEMA_VERSION,
+    history,
+  });
+}
+
+function normalizeDeviceHistory(value: unknown): DeviceProfileVersion[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const normalized: DeviceProfileVersion[] = [];
+  for (const item of value) {
+    if (!isPlainObject(item)) {
+      continue;
+    }
+    const itemRecord = item as Record<string, unknown>;
+
+    const profile = normalizeDeviceProfile(itemRecord.profile);
+    if (!profile) {
+      continue;
+    }
+
+    const id = isString(itemRecord.id) && itemRecord.id.length > 0 ? itemRecord.id : uuidv4();
+    const createdAtCandidate = itemRecord.createdAt;
+    const createdAt =
+      isNumber(createdAtCandidate) && Number.isFinite(createdAtCandidate)
+        ? Math.floor(createdAtCandidate)
+        : Math.floor(Date.now() / 1000);
+    const label =
+      isString(itemRecord.label) && itemRecord.label.length > 0 ? itemRecord.label : 'legacy';
+    const isCurrent = itemRecord.isCurrent === true;
+
+    normalized.push({
+      id,
+      createdAt,
+      label,
+      profile,
+      isCurrent,
+    });
+  }
+
+  return normalized;
+}
+
+function parseDeviceProfileColumn(value: string | null | undefined): DeviceProfile | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error('invalid_device_profile_json');
+  }
+  const normalized = normalizeDeviceProfile(readVersionedProfilePayload(parsed));
+  if (!normalized) {
+    throw new Error('invalid_device_profile_json');
+  }
+  return normalized;
+}
+
+function parseDeviceHistoryColumn(
+  value: string | null | undefined,
+): DeviceProfileVersion[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error('invalid_device_history_json');
+  }
+  const payload = readVersionedHistoryPayload(parsed);
+  if (!Array.isArray(payload)) {
+    throw new Error('invalid_device_history_json');
+  }
+  const normalized = normalizeDeviceHistory(payload);
+  if (!normalized) {
+    throw new Error('invalid_device_history_json');
+  }
+  if (normalized.length !== payload.length) {
+    throw new Error('invalid_device_history_entry');
+  }
+  return normalized;
+}
+
+function createMigrationStats(): MigrationStats {
+  return {
+    totalFields: 0,
+    fallbackUsedFields: 0,
+    migratedFields: 0,
+    migratedBySource: {
+      safeStorage: 0,
+      keytar: 0,
+      file: 0,
+    },
+    failedFields: 0,
+  };
+}
+
+async function decryptAndMigrateField(
+  orm: DrizzleExecutor,
+  accountId: string,
+  field: 'tokenJson' | 'quotaJson',
+  value: string | null,
+): Promise<{ value: string | null; migrated: boolean; usedFallback?: KeySource }> {
+  if (!value) {
+    return { value: null, migrated: false };
+  }
+
+  const result = await decryptWithMigration(value);
+  if (result.reencrypted) {
+    if (field === 'tokenJson') {
+      orm
+        .update(accounts)
+        .set({ tokenJson: result.reencrypted })
+        .where(eq(accounts.id, accountId))
+        .run();
+    } else {
+      orm
+        .update(accounts)
+        .set({ quotaJson: result.reencrypted })
+        .where(eq(accounts.id, accountId))
+        .run();
+    }
+    logger.info(
+      `Migrated ${field} for account ${accountId} from ${result.usedFallback ?? 'unknown'} key`,
+    );
+  }
+
+  return {
+    value: result.value,
+    migrated: Boolean(result.reencrypted),
+    usedFallback: result.usedFallback,
+  };
+}
+
+type DecryptFieldResult = Awaited<ReturnType<typeof decryptAndMigrateField>>;
+
+export class CloudAccountRepo {
+  private static versionFailureLogged = false;
+
+  static async init(): Promise<void> {
+    const dbPath = getCloudAccountsDbPath();
+    ensureDatabaseInitialized(dbPath);
+    await this.migrateToEncrypted();
+  }
+
+  static async migrateToEncrypted(): Promise<void> {
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({
+          id: accounts.id,
+          tokenJson: accounts.tokenJson,
+          quotaJson: accounts.quotaJson,
+        })
+        .from(accounts)
+        .all();
+
+      for (const row of rows) {
+        let changed = false;
+        let newToken = row.tokenJson;
+        let newQuota = row.quotaJson;
+
+        // Check if plain text (starts with {)
+        if (newToken && newToken.startsWith('{')) {
+          newToken = await encrypt(newToken);
+          changed = true;
+        }
+        if (newQuota && newQuota.startsWith('{')) {
+          newQuota = await encrypt(newQuota);
+          changed = true;
+        }
+
+        if (changed) {
+          orm
+            .update(accounts)
+            .set({ tokenJson: newToken, quotaJson: newQuota })
+            .where(eq(accounts.id, row.id))
+            .run();
+          logger.info(`Migrated account ${row.id} to encrypted storage`);
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to migrate data', error);
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async addAccount(account: CloudAccount): Promise<void> {
+    // Validate account data before processing
+    CloudAccountSchema.parse(account);
+
+    const { raw, orm } = getCloudDb();
+    try {
+      const tokenEncrypted = await encrypt(JSON.stringify(account.token));
+      const quotaEncrypted = account.quota ? await encrypt(JSON.stringify(account.quota)) : null;
+      const values = {
+        id: account.id,
+        provider: account.provider,
+        email: account.email,
+        name: account.name ?? null,
+        avatarUrl: account.avatar_url ?? null,
+        tokenJson: tokenEncrypted,
+        quotaJson: quotaEncrypted,
+        deviceProfileJson: serializeDeviceProfile(account.device_profile),
+        deviceHistoryJson: serializeDeviceHistory(account.device_history),
+        createdAt: account.created_at,
+        lastUsed: account.last_used,
+        status: account.status || 'active',
+        statusReason: account.status_reason ?? null,
+        isActive: account.is_active ? 1 : 0,
+        proxyUrl: account.proxy_url ?? null,
+      };
+
+      orm.transaction((transaction) => {
+        // If this account is being set to active, deactivate all others first
+        if (account.is_active) {
+          logger.debug(
+            `Deactivating other cloud accounts because ${account.email} is being marked active`,
+          );
+          const deactivationResult = transaction.update(accounts).set({ isActive: 0 }).run();
+          logger.debug(`Deactivated ${deactivationResult.changes} cloud account rows`);
+        }
+        transaction
+          .insert(accounts)
+          .values(values)
+          .onConflictDoUpdate({
+            target: accounts.id,
+            set: values,
+          })
+          .run();
+      });
+      logger.info(`Added/Updated cloud account: ${account.email}`);
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async getAccounts(): Promise<CloudAccount[]> {
+    const { raw, orm } = getCloudDb();
+    const migrationStats = createMigrationStats();
+
+    try {
+      const rows = orm.select().from(accounts).orderBy(desc(accounts.lastUsed)).all();
+
+      const activeRows = rows.filter((row) => row.isActive);
+      logger.debug(`Loaded ${rows.length} cloud accounts; ${activeRows.length} are active.`);
+      activeRows.forEach((row) => logger.debug(`Active cloud account: ${row.email} (${row.id})`));
+
+      const cloudAccounts: CloudAccount[] = [];
+      for (const normalizedRow of rows) {
+        try {
+          let tokenResult: DecryptFieldResult;
+          try {
+            tokenResult = await decryptAndMigrateField(
+              orm,
+              normalizedRow.id,
+              'tokenJson',
+              normalizedRow.tokenJson,
+            );
+          } catch (error) {
+            migrationStats.failedFields += 1;
+            logger.error(`Failed to decrypt token for account ${normalizedRow.id}`, error);
+            if (isDataMigrationError(error)) {
+              throw error;
+            }
+            continue; // Skip corrupted account
+          }
+
+          let quotaResult: DecryptFieldResult;
+          try {
+            quotaResult = await decryptAndMigrateField(
+              orm,
+              normalizedRow.id,
+              'quotaJson',
+              normalizedRow.quotaJson,
+            );
+          } catch (error) {
+            migrationStats.failedFields += 1;
+            logger.error(`Failed to decrypt quota for account ${normalizedRow.id}`, error);
+            if (isDataMigrationError(error)) {
+              throw error;
+            }
+            quotaResult = { value: null, migrated: false }; // Quota is optional, proceed
+          }
+
+          if (!tokenResult.value) {
+            logger.warn(`Missing token data for account ${normalizedRow.id}`);
+            continue;
+          }
+
+          if (tokenResult.value) {
+            migrationStats.totalFields += 1;
+          }
+          if (tokenResult.usedFallback) {
+            migrationStats.fallbackUsedFields += 1;
+          }
+          if (tokenResult.migrated) {
+            migrationStats.migratedFields += 1;
+            if (tokenResult.usedFallback) {
+              migrationStats.migratedBySource[tokenResult.usedFallback] += 1;
+            }
+          }
+
+          if (quotaResult.value) {
+            migrationStats.totalFields += 1;
+          }
+          if (quotaResult.usedFallback) {
+            migrationStats.fallbackUsedFields += 1;
+          }
+          if (quotaResult.migrated) {
+            migrationStats.migratedFields += 1;
+            if (quotaResult.usedFallback) {
+              migrationStats.migratedBySource[quotaResult.usedFallback] += 1;
+            }
+          }
+
+          cloudAccounts.push({
+            id: normalizedRow.id,
+            provider: normalizedRow.provider as CloudAccount['provider'],
+            email: normalizedRow.email,
+            name: normalizedRow.name ?? undefined,
+            avatar_url: normalizedRow.avatarUrl ?? undefined,
+            token: JSON.parse(tokenResult.value),
+            quota: quotaResult.value ? JSON.parse(quotaResult.value) : undefined,
+            device_profile: parseDeviceProfileColumn(normalizedRow.deviceProfileJson),
+            device_history: parseDeviceHistoryColumn(normalizedRow.deviceHistoryJson),
+            created_at: normalizedRow.createdAt,
+            last_used: normalizedRow.lastUsed,
+            status: (normalizedRow.status as CloudAccount['status']) ?? undefined,
+            status_reason: normalizedRow.statusReason ?? undefined,
+            is_active: Boolean(normalizedRow.isActive),
+            proxy_url: normalizedRow.proxyUrl ?? undefined,
+          });
+        } catch (rowError) {
+          if (isDataMigrationError(rowError)) {
+            throw rowError;
+          }
+          logger.error(`Unexpected error processing row for account ${normalizedRow.id}`, rowError);
+          continue;
+        }
+      }
+
+      return cloudAccounts;
+    } finally {
+      if (
+        migrationStats.migratedFields > 0 ||
+        migrationStats.fallbackUsedFields > 0 ||
+        migrationStats.failedFields > 0
+      ) {
+        const summary = {
+          totalFields: migrationStats.totalFields,
+          fallbackUsedFields: migrationStats.fallbackUsedFields,
+          migratedFields: migrationStats.migratedFields,
+          migratedBySource: migrationStats.migratedBySource,
+          failedFields: migrationStats.failedFields,
+        };
+        if (migrationStats.failedFields > 0) {
+          logger.warn('CloudAccountRepo migration summary (with failures)', summary);
+        } else {
+          logger.info('CloudAccountRepo migration summary', summary);
+        }
+      }
+      raw.close();
+    }
+  }
+
+  static async getAccount(id: string): Promise<CloudAccount | undefined> {
+    const { raw, orm } = getCloudDb();
+
+    try {
+      const rows = orm.select().from(accounts).where(eq(accounts.id, id)).all();
+      const normalizedRow = rows[0];
+      if (!normalizedRow) {
+        return undefined;
+      }
+
+      let tokenResult: DecryptFieldResult;
+      try {
+        tokenResult = await decryptAndMigrateField(
+          orm,
+          normalizedRow.id,
+          'tokenJson',
+          normalizedRow.tokenJson,
+        );
+      } catch (error) {
+        logger.error(
+          `[CloudAccountRepo] getAccount ${id} failed - Decryption failed for token`,
+          error,
+        );
+        if (isDataMigrationError(error)) {
+          throw error;
+        }
+        return undefined;
+      }
+
+      let quotaResult: DecryptFieldResult;
+      try {
+        quotaResult = await decryptAndMigrateField(
+          orm,
+          normalizedRow.id,
+          'quotaJson',
+          normalizedRow.quotaJson,
+        );
+      } catch (error) {
+        logger.error(
+          `[CloudAccountRepo] getAccount ${id} failed - Decryption failed for quota`,
+          error,
+        );
+        if (isDataMigrationError(error)) {
+          throw error;
+        }
+        quotaResult = { value: null, migrated: false };
+      }
+
+      const tokenValue = tokenResult.value;
+      if (!tokenValue) {
+        return undefined;
+      }
+
+      return {
+        id: normalizedRow.id,
+        provider: normalizedRow.provider as CloudAccount['provider'],
+        email: normalizedRow.email,
+        name: normalizedRow.name ?? undefined,
+        avatar_url: normalizedRow.avatarUrl ?? undefined,
+        token: JSON.parse(tokenValue),
+        quota: quotaResult.value ? JSON.parse(quotaResult.value) : undefined,
+        device_profile: parseDeviceProfileColumn(normalizedRow.deviceProfileJson),
+        device_history: parseDeviceHistoryColumn(normalizedRow.deviceHistoryJson),
+        created_at: normalizedRow.createdAt,
+        last_used: normalizedRow.lastUsed,
+        status: (normalizedRow.status as CloudAccount['status']) ?? undefined,
+        status_reason: normalizedRow.statusReason ?? undefined,
+        is_active: Boolean(normalizedRow.isActive),
+        proxy_url: normalizedRow.proxyUrl ?? undefined,
+      };
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async removeAccount(id: string): Promise<void> {
+    const { raw, orm } = getCloudDb();
+    try {
+      orm.delete(accounts).where(eq(accounts.id, id)).run();
+      logger.info(`Removed cloud account: ${id}`);
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async updateToken(id: string, token: any): Promise<void> {
+    // Validate token data before encryption
+    CloudTokenDataSchema.parse(token);
+
+    const { raw, orm } = getCloudDb();
+
+    try {
+      const encrypted = await encrypt(JSON.stringify(token));
+      const result = orm
+        .update(accounts)
+        .set({ tokenJson: encrypted })
+        .where(eq(accounts.id, id))
+        .run();
+      if (result.changes === 0) {
+        logger.warn(`updateToken: No account found with ID ${id}`);
+      }
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async updateQuota(id: string, quota: any): Promise<void> {
+    // Validate quota data before encryption
+    CloudQuotaDataSchema.parse(quota);
+
+    const { raw, orm } = getCloudDb();
+
+    try {
+      const encrypted = await encrypt(JSON.stringify(quota));
+      const result = orm
+        .update(accounts)
+        .set({ quotaJson: encrypted })
+        .where(eq(accounts.id, id))
+        .run();
+      if (result.changes === 0) {
+        logger.warn(`updateQuota: No account found with ID ${id}`);
+      }
+    } finally {
+      raw.close();
+    }
+  }
+
+  static updateLastUsed(id: string): void {
+    const { raw, orm } = getCloudDb();
+    try {
+      orm
+        .update(accounts)
+        .set({ lastUsed: Math.floor(Date.now() / 1000) })
+        .where(eq(accounts.id, id))
+        .run();
+    } finally {
+      raw.close();
+    }
+  }
+
+  static setDeviceBinding(id: string, profile: DeviceProfile, label: string): void {
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({
+          deviceProfileJson: accounts.deviceProfileJson,
+          deviceHistoryJson: accounts.deviceHistoryJson,
+        })
+        .from(accounts)
+        .where(eq(accounts.id, id))
+        .all();
+      const row = rows[0];
+      if (!row) {
+        throw new Error(`Account not found: ${id}`);
+      }
+
+      const boundProfile = parseDeviceProfileColumn(row.deviceProfileJson);
+      if (boundProfile && areDeviceProfilesEqual(boundProfile, profile)) {
+        logger.info(
+          `Skipping duplicate device profile binding for account ${id} (bound profile match)`,
+        );
+        return;
+      }
+
+      const historyRaw = parseDeviceHistoryColumn(row.deviceHistoryJson) || [];
+      const currentVersion = historyRaw.find((version) => version.isCurrent);
+      const latestVersion = historyRaw.length > 0 ? historyRaw[historyRaw.length - 1] : undefined;
+      if (currentVersion && areDeviceProfilesEqual(currentVersion.profile, profile)) {
+        logger.info(
+          `Skipping duplicate device profile binding for account ${id} (history current match)`,
+        );
+        return;
+      }
+      if (
+        !currentVersion &&
+        latestVersion &&
+        areDeviceProfilesEqual(latestVersion.profile, profile)
+      ) {
+        logger.info(
+          `Skipping duplicate device profile binding for account ${id} (history latest match)`,
+        );
+        return;
+      }
+
+      const history = historyRaw.map((version) => ({
+        ...version,
+        isCurrent: false,
+      }));
+
+      history.push({
+        id: uuidv4(),
+        createdAt: Math.floor(Date.now() / 1000),
+        label,
+        profile,
+        isCurrent: true,
+      });
+
+      orm
+        .update(accounts)
+        .set({
+          deviceProfileJson: serializeDeviceProfile(profile),
+          deviceHistoryJson: serializeDeviceHistory(history),
+        })
+        .where(eq(accounts.id, id))
+        .run();
+    } finally {
+      raw.close();
+    }
+  }
+
+  static getDeviceBinding(id: string): {
+    profile?: DeviceProfile;
+    history: DeviceProfileVersion[];
+  } {
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({
+          deviceProfileJson: accounts.deviceProfileJson,
+          deviceHistoryJson: accounts.deviceHistoryJson,
+        })
+        .from(accounts)
+        .where(eq(accounts.id, id))
+        .all();
+      const row = rows[0];
+      if (!row) {
+        throw new Error(`Account not found: ${id}`);
+      }
+
+      return {
+        profile: parseDeviceProfileColumn(row.deviceProfileJson),
+        history: parseDeviceHistoryColumn(row.deviceHistoryJson) || [],
+      };
+    } finally {
+      raw.close();
+    }
+  }
+
+  static restoreDeviceVersion(
+    id: string,
+    versionId: string,
+    baseline: DeviceProfile | null,
+  ): DeviceProfile {
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({
+          deviceProfileJson: accounts.deviceProfileJson,
+          deviceHistoryJson: accounts.deviceHistoryJson,
+        })
+        .from(accounts)
+        .where(eq(accounts.id, id))
+        .all();
+      const row = rows[0];
+      if (!row) {
+        throw new Error(`Account not found: ${id}`);
+      }
+
+      const currentProfile = parseDeviceProfileColumn(row.deviceProfileJson);
+      const history = parseDeviceHistoryColumn(row.deviceHistoryJson) || [];
+
+      let targetProfile: DeviceProfile;
+      if (versionId === 'baseline') {
+        if (!baseline) {
+          throw new Error('Global original profile not found');
+        }
+        targetProfile = baseline;
+      } else if (versionId === 'current') {
+        if (!currentProfile) {
+          throw new Error('No currently bound profile');
+        }
+        targetProfile = currentProfile;
+      } else {
+        const targetVersion = history.find((version) => version.id === versionId);
+        if (!targetVersion) {
+          throw new Error('Device profile version not found');
+        }
+        targetProfile = targetVersion.profile;
+      }
+
+      const nextHistory = history.map((version) => ({
+        ...version,
+        isCurrent: version.id === versionId,
+      }));
+
+      orm
+        .update(accounts)
+        .set({
+          deviceProfileJson: serializeDeviceProfile(targetProfile),
+          deviceHistoryJson: serializeDeviceHistory(nextHistory),
+        })
+        .where(eq(accounts.id, id))
+        .run();
+
+      return targetProfile;
+    } finally {
+      raw.close();
+    }
+  }
+
+  static deleteDeviceVersion(id: string, versionId: string): void {
+    if (versionId === 'baseline') {
+      throw new Error('Original profile cannot be deleted');
+    }
+
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({ deviceHistoryJson: accounts.deviceHistoryJson })
+        .from(accounts)
+        .where(eq(accounts.id, id))
+        .all();
+      const row = rows[0];
+      if (!row) {
+        throw new Error(`Account not found: ${id}`);
+      }
+
+      const history = parseDeviceHistoryColumn(row.deviceHistoryJson) || [];
+      if (history.some((version) => version.id === versionId && version.isCurrent)) {
+        throw new Error('Currently bound profile cannot be deleted');
+      }
+
+      const nextHistory = history.filter((version) => version.id !== versionId);
+      if (nextHistory.length === history.length) {
+        throw new Error('Historical device profile not found');
+      }
+
+      orm
+        .update(accounts)
+        .set({ deviceHistoryJson: serializeDeviceHistory(nextHistory) })
+        .where(eq(accounts.id, id))
+        .run();
+    } finally {
+      raw.close();
+    }
+  }
+
+  static setActive(id: string): void {
+    const { raw, orm } = getCloudDb();
+
+    try {
+      orm.transaction((transaction) => {
+        transaction.update(accounts).set({ isActive: 0 }).run();
+        transaction.update(accounts).set({ isActive: 1 }).where(eq(accounts.id, id)).run();
+      });
+      logger.info(`Set account ${id} as active`);
+    } finally {
+      raw.close();
+    }
+  }
+
+  static setActiveForTarget(target: AntigravityAppTarget | undefined, id: string): void {
+    const normalizedTarget = resolveAntigravityAppTarget(target);
+    this.setSetting(`${ACTIVE_ACCOUNT_SETTING_PREFIX}.${normalizedTarget}`, id);
+  }
+
+  static getActiveAccountIdForTarget(target: AntigravityAppTarget | undefined): string {
+    const normalizedTarget = resolveAntigravityAppTarget(target);
+    return this.getSetting(`${ACTIVE_ACCOUNT_SETTING_PREFIX}.${normalizedTarget}`, '');
+  }
+
+  static setAccountProxy(id: string, proxyUrl: string | null): void {
+    const { raw, orm } = getCloudDb();
+    try {
+      orm.update(accounts).set({ proxyUrl }).where(eq(accounts.id, id)).run();
+      logger.info(`Updated proxy for account ${id}: ${proxyUrl ?? 'none'}`);
+    } catch (error) {
+      logger.error(`Failed to update proxy for account ${id}`, error);
+      throw error;
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async setAccountStatus(
+    id: string,
+    status: CloudAccount['status'],
+    reason?: string | null,
+  ): Promise<void> {
+    const { raw, orm } = getCloudDb();
+    try {
+      orm
+        .update(accounts)
+        .set({
+          status,
+          statusReason: reason?.trim() ? reason.trim() : null,
+        })
+        .where(eq(accounts.id, id))
+        .run();
+    } finally {
+      raw.close();
+    }
+  }
+
+  static async getAccountByEmail(email: string): Promise<CloudAccount | null> {
+    const allAccounts = await this.getAccounts();
+    return (
+      allAccounts.find((account) => account.email.toLowerCase() === email.toLowerCase()) || null
+    );
+  }
+
+  private static upsertItemValue(db: DrizzleExecutor, key: string, value: string): void {
+    db.insert(itemTable)
+      .values({ key, value })
+      .onConflictDoUpdate({
+        target: itemTable.key,
+        set: { value },
+      })
+      .run();
+  }
+
+  private static writeAuthStatusAndCleanup(db: DrizzleExecutor, account: CloudAccount): void {
+    const authStatus = {
+      name: account.name || account.email,
+      email: account.email,
+      apiKey: account.token.access_token,
+    };
+
+    this.upsertItemValue(db, 'antigravityAuthStatus', JSON.stringify(authStatus));
+    this.upsertItemValue(db, 'antigravityOnboarding', 'true');
+    db.delete(itemTable).where(eq(itemTable.key, 'google.antigravity')).run();
+  }
+
+  private static getItemValue(db: DrizzleExecutor, key: string, context: string): string | null {
+    const rows = db
+      .select({ value: itemTable.value })
+      .from(itemTable)
+      .where(eq(itemTable.key, key))
+      .all();
+    const row = parseRow(ItemTableValueRowSchema, rows[0], context);
+    return row?.value ?? null;
+  }
+
+  private static shouldWriteGcpTos(account: CloudAccount): boolean {
+    if (account.token.oauth_client_key === 'antigravity_enterprise') {
+      return false;
+    }
+
+    return account.token.is_gcp_tos ?? false;
+  }
+
+  private static injectNewFormat(
+    orm: BetterSQLite3Database<typeof drizzleSchema>,
+    account: CloudAccount,
+  ): void {
+    const oauthToken = ProtobufUtils.createUnifiedOAuthToken(
+      account.token.access_token,
+      account.token.refresh_token,
+      account.token.expiry_timestamp,
+      this.shouldWriteGcpTos(account),
+      account.token.id_token,
+      account.email,
+    );
+    const userStatusPayload = ProtobufUtils.createMinimalUserStatusPayload(account.email);
+    const userStatusEntry = ProtobufUtils.createUnifiedStateEntry(
+      'userStatusSentinelKey',
+      userStatusPayload,
+    );
+    const normalizedProjectId = account.token.project_id?.trim();
+
+    orm.transaction((transaction) => {
+      this.upsertItemValue(transaction, 'antigravityUnifiedStateSync.oauthToken', oauthToken);
+      this.upsertItemValue(transaction, 'antigravityUnifiedStateSync.userStatus', userStatusEntry);
+      if (normalizedProjectId) {
+        const projectPayload = ProtobufUtils.createStringValuePayload(normalizedProjectId);
+        const projectEntry = ProtobufUtils.createUnifiedStateEntry(
+          'enterpriseGcpProjectId',
+          projectPayload,
+        );
+        this.upsertItemValue(
+          transaction,
+          'antigravityUnifiedStateSync.enterprisePreferences',
+          projectEntry,
+        );
+      } else {
+        transaction
+          .delete(itemTable)
+          .where(eq(itemTable.key, 'antigravityUnifiedStateSync.enterprisePreferences'))
+          .run();
+      }
+      this.writeAuthStatusAndCleanup(transaction, account);
+    });
+  }
+
+  private static injectOldFormat(
+    orm: BetterSQLite3Database<typeof drizzleSchema>,
+    account: CloudAccount,
+  ): void {
+    const encodedAgentState = this.getItemValue(
+      orm,
+      'jetskiStateSync.agentManagerInitState',
+      'ide.itemTable.jetskiStateSync.agentManagerInitState',
+    );
+
+    orm.transaction((transaction) => {
+      if (!encodedAgentState) {
+        logger.warn(
+          'jetskiStateSync.agentManagerInitState not found. ' +
+            'Injecting minimal auth state only. User may need to complete onboarding in the IDE first.',
+        );
+
+        this.writeAuthStatusAndCleanup(transaction, account);
+
+        logger.info(
+          `Injected minimal auth state for ${account.email} (no protobuf state available)`,
+        );
+        return;
+      }
+
+      const encodedStateBuffer = Buffer.from(encodedAgentState, 'base64');
+      const agentStateBytes = new Uint8Array(encodedStateBuffer);
+      const stateWithoutPreviousToken = ProtobufUtils.removeField(agentStateBytes, 6);
+      const oauthTokenField = ProtobufUtils.createOAuthTokenInfo(
+        account.token.access_token,
+        account.token.refresh_token,
+        account.token.expiry_timestamp,
+      );
+
+      const updatedAgentStateBytes = new Uint8Array(
+        stateWithoutPreviousToken.length + oauthTokenField.length,
+      );
+      updatedAgentStateBytes.set(stateWithoutPreviousToken, 0);
+      updatedAgentStateBytes.set(oauthTokenField, stateWithoutPreviousToken.length);
+
+      const updatedEncodedAgentState = Buffer.from(updatedAgentStateBytes).toString('base64');
+
+      transaction
+        .update(itemTable)
+        .set({ value: updatedEncodedAgentState })
+        .where(eq(itemTable.key, 'jetskiStateSync.agentManagerInitState'))
+        .run();
+
+      this.writeAuthStatusAndCleanup(transaction, account);
+    });
+  }
+
+  private static detectFormatCapability(db: DrizzleExecutor): 'new' | 'old' | 'dual' | null {
+    const unifiedValue = this.getItemValue(
+      db,
+      'antigravityUnifiedStateSync.oauthToken',
+      'ide.itemTable.antigravityUnifiedStateSync.oauthToken',
+    );
+    const oldValue = this.getItemValue(
+      db,
+      'jetskiStateSync.agentManagerInitState',
+      'ide.itemTable.jetskiStateSync.agentManagerInitState',
+    );
+
+    if (unifiedValue && oldValue) {
+      return 'dual';
+    }
+    if (unifiedValue) {
+      return 'new';
+    }
+    if (oldValue) {
+      return 'old';
+    }
+
+    return null;
+  }
+
+  static shouldInjectTokenIntoCredentialStore(appTarget?: AntigravityAppTarget): boolean {
+    if (resolveAntigravityAppTarget(appTarget) === 'ide') {
+      return false;
+    }
+
+    try {
+      const version = getAntigravityVersion(appTarget);
+
+      // Heuristic Check:
+      // Some Linux builds expose Chromium/Electron engine versions (e.g., 1.107.0)
+      // instead of the product version (e.g., 2.0.6). Treat only modern Chromium-like
+      // values as credential-store capable so pre-2.0 product versions such as 1.99.9
+      // still follow the normal semantic version gate.
+      const parts = version.shortVersion.split('.');
+      if (parts.length >= 2) {
+        const secondPart = parseInt(parts[1], 10);
+        if (secondPart >= 100) {
+          logger.info(
+            `Version ${version.shortVersion} appears to be a Chromium engine version, ` +
+              `defaulting to credential store for Classic Antigravity`,
+          );
+          return true;
+        }
+      }
+
+      return isCredentialStoreVersion(version);
+    } catch (error) {
+      logger.warn(
+        'Version detection failed; defaulting to credential store for Classic Antigravity',
+        error,
+      );
+      return true;
+    }
+  }
+
+  private static resolveInjectionStrategy(
+    db: DrizzleExecutor,
+    appTarget?: AntigravityAppTarget,
+  ): {
+    name: 'new' | 'old' | 'dual';
+    reason: string;
+  } {
+    try {
+      const version = getAntigravityVersion(appTarget);
+      return {
+        name: isNewVersion(version) ? 'new' : 'old',
+        reason: `version:${version.shortVersion}`,
+      };
+    } catch (error) {
+      if (!this.versionFailureLogged) {
+        logger.warn('Version detection failed, falling back to capability detection', error);
+        this.versionFailureLogged = true;
+      }
+    }
+
+    const capability = this.detectFormatCapability(db);
+    if (capability) {
+      return { name: capability, reason: 'capability' };
+    }
+
+    return { name: 'dual', reason: 'fallback' };
+  }
+
+  private static getStrategy(name: 'new' | 'old'): {
+    name: 'new' | 'old';
+    inject: (db: BetterSQLite3Database<typeof drizzleSchema>, account: CloudAccount) => void;
+  } {
+    if (name === 'new') {
+      return { name, inject: (db, account) => this.injectNewFormat(db, account) };
+    }
+    return { name, inject: (db, account) => this.injectOldFormat(db, account) };
+  }
+
+  private static injectWithRetry(
+    dbPath: string,
+    account: CloudAccount,
+    appTarget?: AntigravityAppTarget,
+  ): { strategy: string; attempts: number } {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= SQLITE_MAX_RETRIES; attempt += 1) {
+      const { raw, orm } = getIdeDb(dbPath, false);
+      try {
+        const { name, reason } = this.resolveInjectionStrategy(orm, appTarget);
+        if (name === 'dual') {
+          let newInjected = false;
+          let oldInjected = false;
+
+          try {
+            this.injectNewFormat(orm, account);
+            newInjected = true;
+          } catch (newError) {
+            logger.warn('Failed to inject new format', newError);
+          }
+
+          try {
+            this.injectOldFormat(orm, account);
+            oldInjected = true;
+          } catch (oldError) {
+            logger.warn('Failed to inject old format', oldError);
+          }
+
+          if (!newInjected && !oldInjected) {
+            throw new Error('Token injection failed for both formats');
+          }
+
+          return { strategy: `dual:${reason}`, attempts: attempt };
+        }
+
+        const strategy = this.getStrategy(name);
+        strategy.inject(orm, account);
+        return { strategy: `${strategy.name}:${reason}`, attempts: attempt };
+      } catch (error) {
+        lastError = error;
+        if (isSqliteBusyError(error) && attempt < SQLITE_MAX_RETRIES) {
+          logger.warn(`SQLite busy, retrying injection (attempt ${attempt})`, error);
+          sleepSync(SQLITE_RETRY_DELAY_MS);
+          continue;
+        }
+        throw error;
+      } finally {
+        raw.close();
+      }
+    }
+
+    throw lastError;
+  }
+
+  static injectCloudToken(account: CloudAccount, appTarget?: AntigravityAppTarget): void {
+    const dbPaths = getAntigravityDbPaths(appTarget);
+    const dbPath = dbPaths.find((candidatePath) => fs.existsSync(candidatePath)) ?? null;
+
+    if (!dbPath) {
+      throw new Error(`Antigravity database not found. Checked paths: ${dbPaths.join(', ')}`);
+    }
+
+    const result = this.injectWithRetry(dbPath, account, appTarget);
+    logger.info(
+      `Successfully injected cloud token and identity for ${account.email} into Antigravity database at ${dbPath} (strategy=${result.strategy}, attempts=${result.attempts}).`,
+    );
+  }
+
+  static injectCloudTokenWithStorageStrategy(
+    account: CloudAccount,
+    appTarget?: AntigravityAppTarget,
+  ): 'credential-store' | 'sqlite' {
+    if (this.shouldInjectTokenIntoCredentialStore(appTarget)) {
+      writeAntigravityCredentialStoreToken(account.token);
+      return 'credential-store';
+    }
+
+    this.injectCloudToken(account, appTarget);
+    return 'sqlite';
+  }
+
+  static getSetting<T>(key: string, defaultValue: T): T {
+    const { raw, orm } = getCloudDb();
+    try {
+      const rows = orm
+        .select({ value: settings.value })
+        .from(settings)
+        .where(eq(settings.key, key))
+        .all();
+      const row = rows[0];
+      if (!row) {
+        return defaultValue;
+      }
+      return JSON.parse(row.value) as T;
+    } catch (error) {
+      logger.error(`Failed to get setting ${key}`, error);
+      return defaultValue;
+    } finally {
+      raw.close();
+    }
+  }
+
+  static setSetting(key: string, value: unknown): void {
+    const { raw, orm } = getCloudDb();
+    try {
+      const stringValue = JSON.stringify(value);
+      orm
+        .insert(settings)
+        .values({ key, value: stringValue })
+        .onConflictDoUpdate({
+          target: settings.key,
+          set: { value: stringValue },
+        })
+        .run();
+    } finally {
+      raw.close();
+    }
+  }
+
+  private static readTokenInfoFromDb(db: DrizzleExecutor): {
+    accessToken: string;
+    refreshToken: string;
+    idToken?: string;
+    projectId?: string;
+  } {
+    const enterpriseProjectId = this.readEnterpriseProjectIdFromDb(db);
+    const unifiedValue = this.getItemValue(
+      db,
+      'antigravityUnifiedStateSync.oauthToken',
+      'ide.itemTable.antigravityUnifiedStateSync.oauthToken',
+    );
+
+    let tokenInfo: { accessToken: string; refreshToken: string; idToken?: string } | null = null;
+    if (unifiedValue) {
+      try {
+        const unifiedBuffer = Buffer.from(unifiedValue, 'base64');
+        const unifiedData = new Uint8Array(unifiedBuffer);
+        tokenInfo = ProtobufUtils.extractOAuthTokenInfoFromUnifiedState(unifiedData);
+      } catch (error) {
+        logger.warn('SyncLocal: Failed to parse unified OAuth token', error);
+      }
+    }
+
+    if (!tokenInfo) {
+      const encodedLegacyState = this.getItemValue(
+        db,
+        'jetskiStateSync.agentManagerInitState',
+        'ide.itemTable.jetskiStateSync.agentManagerInitState',
+      );
+
+      if (!encodedLegacyState) {
+        const message =
+          'No cloud account found in IDE. Please login to a Google account in Antigravity IDE first.';
+        logger.warn(`SyncLocal: ${message}`);
+        throw new Error(message);
+      }
+
+      const legacyStateBuffer = Buffer.from(encodedLegacyState, 'base64');
+      const legacyStateBytes = new Uint8Array(legacyStateBuffer);
+      tokenInfo = ProtobufUtils.extractOAuthTokenInfo(legacyStateBytes);
+    }
+
+    if (!tokenInfo) {
+      const message =
+        'No OAuth token found in IDE state. Please login to a Google account in Antigravity IDE first.';
+      logger.warn(`SyncLocal: ${message}`);
+      throw new Error(message);
+    }
+
+    return {
+      ...tokenInfo,
+      projectId: enterpriseProjectId,
+    };
+  }
+
+  private static readTokenInfoWithRetry(dbPath: string): {
+    accessToken: string;
+    refreshToken: string;
+    idToken?: string;
+    projectId?: string;
+  } {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= SQLITE_MAX_RETRIES; attempt += 1) {
+      const { raw, orm } = getIdeDb(dbPath, true);
+      try {
+        return this.readTokenInfoFromDb(orm);
+      } catch (error) {
+        lastError = error;
+        if (isSqliteBusyError(error) && attempt < SQLITE_MAX_RETRIES) {
+          logger.warn(`SQLite busy, retrying IDE read (attempt ${attempt})`, error);
+          sleepSync(SQLITE_RETRY_DELAY_MS);
+          continue;
+        }
+        throw error;
+      } finally {
+        raw.close();
+      }
+    }
+    throw lastError;
+  }
+
+  private static readEnterpriseProjectIdFromDb(db: DrizzleExecutor): string | undefined {
+    const enterprisePreferencesValue = this.getItemValue(
+      db,
+      'antigravityUnifiedStateSync.enterprisePreferences',
+      'ide.itemTable.antigravityUnifiedStateSync.enterprisePreferences',
+    );
+    if (!enterprisePreferencesValue) {
+      return undefined;
+    }
+
+    try {
+      const { sentinelKey, payload } = ProtobufUtils.decodeUnifiedStateEntry(
+        enterprisePreferencesValue,
+      );
+      if (sentinelKey !== 'enterpriseGcpProjectId') {
+        return undefined;
+      }
+
+      const projectBytes = ProtobufUtils.getField(payload, 3);
+      if (!projectBytes) {
+        return undefined;
+      }
+
+      const projectId = ProtobufUtils.readString(projectBytes).trim();
+      if (projectId === '') {
+        return undefined;
+      }
+
+      return projectId;
+    } catch (error) {
+      logger.warn('SyncLocal: Failed to parse enterprise project preference', error);
+      return undefined;
+    }
+  }
+
+  private static shouldRefreshAccessTokenForUserInfo(error: unknown, accessToken: string): boolean {
+    if (accessToken.trim() === '') {
+      return true;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const normalizedMessage = message.toLowerCase();
+
+    return (
+      normalizedMessage.includes('"code":401') ||
+      normalizedMessage.includes('http 401') ||
+      normalizedMessage.includes('unauthenticated') ||
+      normalizedMessage.includes('unauthorized') ||
+      normalizedMessage.includes('missing required authentication credential')
+    );
+  }
+
+  private static isMissingIdeTokenError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalizedMessage = message.toLowerCase();
+
+    return (
+      normalizedMessage.includes('no cloud account found in ide') ||
+      normalizedMessage.includes('no oauth token found in ide state')
+    );
+  }
+
+  static async syncFromIde(appTarget?: AntigravityAppTarget): Promise<CloudAccount | null> {
+    // Try all possible database paths
+    const dbPaths = getAntigravityDbPaths(appTarget);
+    logger.info(`SyncLocal: Checking database paths: ${JSON.stringify(dbPaths)}`);
+
+    const existingDbPaths = dbPaths.filter((candidatePath) => {
+      const pathExists = fs.existsSync(candidatePath);
+      logger.info(`SyncLocal: Checking path: ${candidatePath}, exists: ${pathExists}`);
+      return pathExists;
+    });
+
+    if (existingDbPaths.length === 0) {
+      const message = `Antigravity database not found. Please ensure Antigravity IDE is installed. Checked paths: ${dbPaths.join(', ')}`;
+      logger.error(message);
+      throw new Error(message);
+    }
+
+    try {
+      let dbPath = '';
+      let tokenInfo: {
+        accessToken: string;
+        refreshToken: string;
+        idToken?: string;
+        projectId?: string;
+      } | null = null;
+      let lastTokenReadError: unknown;
+
+      for (const candidatePath of existingDbPaths) {
+        try {
+          tokenInfo = this.readTokenInfoWithRetry(candidatePath);
+          dbPath = candidatePath;
+          break;
+        } catch (error) {
+          lastTokenReadError = error;
+          if (this.isMissingIdeTokenError(error)) {
+            logger.warn(
+              `SyncLocal: No cloud token found at ${candidatePath}, trying next database path`,
+            );
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (!tokenInfo) {
+        throw lastTokenReadError;
+      }
+
+      logger.info(`SyncLocal: Using Antigravity database at: ${dbPath}`);
+      const effectiveTokenInfo = { ...tokenInfo };
+
+      let googleUserInfo;
+      try {
+        if (tokenInfo.accessToken.trim() === '') {
+          throw new Error('IDE OAuth access token is empty');
+        }
+        googleUserInfo = await GoogleAPIService.getUserInfo(tokenInfo.accessToken);
+      } catch (apiError: unknown) {
+        if (!this.shouldRefreshAccessTokenForUserInfo(apiError, tokenInfo.accessToken)) {
+          const apiErrorMessage = apiError instanceof Error ? apiError.message : String(apiError);
+          const message = `Failed to validate token with Google API. The token may be expired. Please re-login in Antigravity IDE. Error: ${apiErrorMessage}`;
+          logger.error(`SyncLocal: ${message}`, apiError);
+          throw new Error(message);
+        }
+
+        try {
+          const refreshedToken = await GoogleAPIService.refreshAccessToken(tokenInfo.refreshToken);
+          effectiveTokenInfo.accessToken = refreshedToken.access_token;
+          effectiveTokenInfo.refreshToken = refreshedToken.refresh_token || tokenInfo.refreshToken;
+          effectiveTokenInfo.idToken = refreshedToken.id_token ?? tokenInfo.idToken;
+          googleUserInfo = await GoogleAPIService.getUserInfo(effectiveTokenInfo.accessToken);
+        } catch (refreshError: unknown) {
+          const refreshErrorMessage =
+            refreshError instanceof Error ? refreshError.message : String(refreshError);
+          const message = `Failed to refresh IDE token with Google API. Please re-login in Antigravity IDE. Error: ${refreshErrorMessage}`;
+          logger.error(`SyncLocal: ${message}`, refreshError);
+          throw new Error(message);
+        }
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const account: CloudAccount = {
+        id: uuidv4(), // Generate new ID if new, but check existing email
+        provider: 'google',
+        email: googleUserInfo.email,
+        name: googleUserInfo.name,
+        avatar_url: googleUserInfo.picture,
+        token: {
+          access_token: effectiveTokenInfo.accessToken,
+          refresh_token: effectiveTokenInfo.refreshToken,
+          expires_in: 3600, // Unknown, assume 1 hour validity or let it refresh
+          expiry_timestamp: now + 3600,
+          token_type: 'Bearer',
+          email: googleUserInfo.email,
+          project_id: effectiveTokenInfo.projectId,
+          is_gcp_tos: false,
+          id_token: effectiveTokenInfo.idToken,
+        },
+        created_at: now,
+        last_used: now,
+        status: 'active',
+        is_active: true, // It is the active one in IDE
+      };
+
+      // Check if email already exists to preserve ID
+      const accounts = await this.getAccounts();
+      const existingAccount = accounts.find((savedAccount) => savedAccount.email === account.email);
+      if (existingAccount) {
+        const existingProjectId = existingAccount.token.project_id?.trim();
+
+        account.id = existingAccount.id; // Keep existing ID
+        account.created_at = existingAccount.created_at;
+        account.name = account.name ?? existingAccount.name;
+        account.avatar_url = account.avatar_url ?? existingAccount.avatar_url;
+        account.proxy_url = existingAccount.proxy_url;
+        account.device_profile = existingAccount.device_profile;
+        account.device_history = existingAccount.device_history;
+        account.status = 'active';
+        account.status_reason = undefined;
+        account.token = {
+          ...existingAccount.token,
+          access_token: effectiveTokenInfo.accessToken,
+          refresh_token: effectiveTokenInfo.refreshToken || existingAccount.token.refresh_token,
+          expires_in: 3600,
+          expiry_timestamp: now + 3600,
+          token_type: 'Bearer',
+          email: googleUserInfo.email,
+          project_id: existingProjectId || effectiveTokenInfo.projectId,
+          is_gcp_tos: existingAccount.token.is_gcp_tos ?? false,
+          id_token: effectiveTokenInfo.idToken ?? existingAccount.token.id_token,
+        };
+      }
+
+      await this.addAccount(account);
+      return account;
+    } catch (error) {
+      logger.error('SyncLocal: Failed to sync account from IDE', error);
+      throw error;
+    }
+  }
+}
