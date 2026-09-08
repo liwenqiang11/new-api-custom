@@ -11,6 +11,13 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+也可以直接加载预编译镜像：
+
+```bash
+docker pull ghcr.io/liwenqiang11/new-api-custom:latest
+docker run -d --name new-api -p 3000:3000 -v new-api-data:/data ghcr.io/liwenqiang11/new-api-custom:latest
+```
+
 也可以直接使用 `Dockerfile` 构建镜像。首次启动后访问 `http://localhost:3000` 完成初始化。
 
 如启用 Antigravity OAuth，请在运行环境中自行设置 `ANTIGRAVITY_OAUTH_CLIENT_ID` 和 `ANTIGRAVITY_OAUTH_CLIENT_SECRET`；本仓库不包含任何登录凭证。
