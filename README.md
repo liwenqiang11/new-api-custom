@@ -13,6 +13,8 @@ docker compose up -d --build
 
 也可以直接使用 `Dockerfile` 构建镜像。首次启动后访问 `http://localhost:3000` 完成初始化。
 
+如启用 Antigravity OAuth，请在运行环境中自行设置 `ANTIGRAVITY_OAUTH_CLIENT_ID` 和 `ANTIGRAVITY_OAUTH_CLIENT_SECRET`；本仓库不包含任何登录凭证。
+
 ## 构建 Antigravity Manager
 
 需要 Node.js 22+ 和 npm 10+：
@@ -29,4 +31,3 @@ npm run make
 ## 文件说明
 
 `new-api/new-api-full` 和 `new-api/new-api-built` 是 Linux 可执行构建产物，通过 Git LFS 管理；它们不是模型权重。请先安装 Git LFS，再执行 `git lfs pull`。
-
