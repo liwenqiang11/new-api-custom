@@ -770,6 +770,7 @@ func cleanFunctionParametersWithDepth(params interface{}, depth int) interface{}
 		if itemsArray, ok := cleanedMap["items"].([]interface{}); ok && len(itemsArray) > 0 {
 			cleanedMap["items"] = cleanFunctionParametersWithDepth(itemsArray[0], depth+1)
 		}
+		ensureGeminiArrayItems(cleanedMap)
 
 		// Recursively clean anyOf
 		if nested, ok := cleanedMap["anyOf"].([]interface{}); ok && nested != nil {
@@ -810,12 +811,36 @@ func cleanFunctionParametersShallow(params interface{}) interface{} {
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
 		delete(cleanedMap, "anyOf")
+		ensureGeminiArrayItems(cleanedMap)
 		return cleanedMap
 	case []interface{}:
 		// Prefer an empty list over deep recursion on attacker-controlled inputs.
 		return []interface{}{}
 	default:
 		return params
+	}
+}
+
+// ensureGeminiArrayItems fills the required item schema for unconstrained JSON
+// Schema arrays. Gemini rejects array declarations without `items`, even though
+// that shape is valid JSON Schema and is commonly emitted by tool providers.
+func ensureGeminiArrayItems(schema map[string]interface{}) {
+	typeName, _ := schema["type"].(string)
+	if !strings.EqualFold(typeName, "ARRAY") {
+		return
+	}
+
+	items, ok := schema["items"].(map[string]interface{})
+	if !ok || len(items) == 0 {
+		schema["items"] = map[string]interface{}{"type": "STRING"}
+		return
+	}
+	if _, hasType := items["type"]; !hasType {
+		if _, hasProperties := items["properties"]; hasProperties {
+			items["type"] = "OBJECT"
+		} else {
+			items["type"] = "STRING"
+		}
 	}
 }
 

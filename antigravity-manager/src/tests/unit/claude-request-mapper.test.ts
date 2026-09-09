@@ -1,7 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import { transformClaudeRequestIn } from '@/modules/proxy-gateway/antigravity/ClaudeRequestMapper';
+import { normalizeObjectJsonSchema } from '@/modules/proxy-gateway/antigravity/JsonSchemaUtils';
 
 describe('transformClaudeRequestIn', () => {
+  it('adds an item schema to nested arrays without items', () => {
+    const schema = normalizeObjectJsonSchema({
+      type: 'object',
+      properties: {
+        query: {
+          type: 'object',
+          properties: {
+            where: { type: 'array' },
+          },
+        },
+      },
+    });
+
+    expect(schema.properties).toEqual({
+      query: {
+        type: 'object',
+        properties: {
+          where: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    });
+  });
+
   it('does not include sessionId in Gemini internal payload for Claude requests', () => {
     const payload = transformClaudeRequestIn({
       model: 'claude-sonnet-4-6',

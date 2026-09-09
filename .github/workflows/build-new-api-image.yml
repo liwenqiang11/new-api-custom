@@ -1,0 +1,39 @@
+name: Build New API image
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'new-api/**'
+      - '.github/workflows/build-new-api-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./new-api
+          file: ./new-api/Dockerfile.runtime-fast
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/new-api-custom:latest

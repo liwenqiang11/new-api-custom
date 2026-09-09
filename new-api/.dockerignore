@@ -19,3 +19,5 @@ docs
 !/web/classic/dist
 !/web/classic/dist/**
 .gomodcache
+new-api-full
+new-api-built

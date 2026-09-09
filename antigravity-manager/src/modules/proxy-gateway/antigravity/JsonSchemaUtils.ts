@@ -204,5 +204,12 @@ function cleanJsonSchemaRecursive(value: any) {
         map['type'] = selectedType;
       }
     }
+
+    // Gemini requires an item schema for every array, while JSON Schema allows
+    // `items` to be omitted. Use a permissive string item schema for such
+    // unconstrained arrays so nested tool parameters cannot be rejected.
+    if (map['type'] === 'array' && (!isObjectLike(map['items']) || isArray(map['items']))) {
+      map['items'] = { type: 'string' };
+    }
   }
 }
