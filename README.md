@@ -1,4 +1,4 @@
-# New API + Antigravity Manager
+﻿# New API + Antigravity Manager
 
 本仓库包含定制版 New API 和 Antigravity Manager，运行数据、数据库、日志、缓存及本地凭据均不纳入版本控制。
 
@@ -14,8 +14,8 @@ docker compose up -d --build
 也可以直接加载预编译镜像：
 
 ```bash
-docker pull ghcr.io/liwenqiang11/new-api-custom:latest
-docker run -d --name new-api -p 3000:3000 -v new-api-data:/data ghcr.io/liwenqiang11/new-api-custom:latest
+docker pull ghcr.io/liwenqiang11/new-api-custom-fixed:latest
+docker run -d --name new-api -p 3000:3000 -v new-api-data:/data ghcr.io/liwenqiang11/new-api-custom-fixed:latest
 ```
 
 也可以直接使用 `Dockerfile` 构建镜像。首次启动后访问 `http://localhost:3000` 完成初始化。
@@ -38,3 +38,4 @@ npm run make
 ## 文件说明
 
 `new-api/new-api-full` 和 `new-api/new-api-built` 是 Linux 可执行构建产物，通过 Git LFS 管理；它们不是模型权重。请先安装 Git LFS，再执行 `git lfs pull`。
+
