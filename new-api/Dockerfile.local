@@ -41,4 +41,6 @@ RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$
 
 FROM calciumion/new-api:latest
 
+LABEL org.opencontainers.image.source="https://github.com/liwenqiang11/new-api-custom"
+
 COPY --from=builder2 /build/new-api /new-api
