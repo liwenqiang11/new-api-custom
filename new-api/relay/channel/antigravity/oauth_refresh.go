@@ -17,7 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 )
 
-const (
+var (
 	antigravityOAuthClientID     = ""
 	antigravityOAuthClientSecret = ""
 	antigravityOAuthTokenURL     = "https://oauth2.googleapis.com/token"
